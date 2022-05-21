@@ -37,7 +37,7 @@ if __name__ == "__main__":
         df.loc[val_index, "fold"] = int(n)
     df["fold"] = df["fold"].astype(int)
 
-    tokenizer = T5Tokenizer.from_pretrained("rinna/japanese-gpt2-medium")
+    tokenizer = T5Tokenizer.from_pretrained("rinna/japanese-gpt-1b")
     tokenizer.pad_token = tokenizer.eos_token
 
     test = pd.read_csv("../input/nishika-fakenews/test.csv")
@@ -61,22 +61,28 @@ if __name__ == "__main__":
             data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
             model = AutoModelForSequenceClassification.from_pretrained(
-                "rinna/japanese-gpt2-medium", num_labels=2
+                "rinna/japanese-gpt-1b", num_labels=2
             )
             model.config.pad_token_id = model.config.eos_token_id
 
+            for name, param in model.named_parameters():
+                if name not in ("score.weight",):
+                    param.requires_grad = False
+
             training_args = TrainingArguments(
-                output_dir=f"./results{fold_id}",
-                learning_rate=1.5e-5,
-                per_device_train_batch_size=2,
+                output_dir=f"../tmp/results{fold_id}",
+                learning_rate=5e-3,
+                per_device_train_batch_size=4,
                 per_device_eval_batch_size=8,
                 num_train_epochs=2,
                 weight_decay=0.01,
                 evaluation_strategy="steps",
-                eval_steps=500,
+                eval_steps=100,
                 load_best_model_at_end=True,
-                #                 save_steps=1000,
-                save_total_limit=1,
+                save_steps=1000,
+                gradient_accumulation_steps=4,
+                save_total_limit=3,
+                fp16=True,
             )
 
             trainer = Trainer(
@@ -90,7 +96,12 @@ if __name__ == "__main__":
             )
 
             trainer.train()
+
+            oof_results = trainer.predict(test_dataset=val_tokenized)
+            np.save(f"oof_prediction{fold_id}", oof_results.predictions)
+
             results = trainer.predict(test_dataset=test_tokenized)
+            np.save(f"test_prediction{fold_id}", results.predictions)
 
     test["isFake"] = np.argmax(results.predictions, axis=-1)
     test[["id", "isFake"]].to_csv("submission.csv", index=False)
