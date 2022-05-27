@@ -30,6 +30,10 @@ if __name__ == "__main__":
     metric = load_metric("accuracy")
 
     df = pd.read_csv("../input/nishika-fakenews/train.csv")
+    df.text = [
+        data[: data.find("。")] + "。[SEP]" + data[data.find("。") + 1 :]
+        for data in df.text
+    ]
     df.columns = ["id", "label", "text"]
 
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
@@ -37,19 +41,33 @@ if __name__ == "__main__":
         df.loc[val_index, "fold"] = int(n)
     df["fold"] = df["fold"].astype(int)
 
-    tokenizer = T5Tokenizer.from_pretrained("rinna/japanese-gpt-1b")
+    tokenizer = T5Tokenizer.from_pretrained("rinna/japanese-gpt2-medium")
     tokenizer.pad_token = tokenizer.eos_token
 
     test = pd.read_csv("../input/nishika-fakenews/test.csv")
+    test.text = [
+        data[: data.find("。")] + "。[SEP]" + data[data.find("。") + 1 :]
+        for data in test.text
+    ]
     test_dataset = datasets.Dataset.from_pandas(test[["text"]])
     test_tokenized = test_dataset.map(preprocess_function, batched=True)
 
+    test_prediction0 = np.load(
+        "../input/nishika-fakenews-rinna-japanese-gpt2-full/test_prediction0.npy"
+    )
+    test["pred0"] = test_prediction0[:, 0]
+    test["pred1"] = test_prediction0[:, 1]
+    test["label"] = (test["pred0"] < test["pred1"]).astype(int)
+    test_filter = test.query("pred0 > 3 or pred0 < -3")[["id", "label", "text"]]
+
     for fold_id in range(5):
 
-        if fold_id in (0,):
+        if fold_id in (0, 1, 2, 3, 4):
 
             train_dataset = datasets.Dataset.from_pandas(
-                df.query(f"fold != {fold_id}")[["text", "label"]]
+                pd.concat([df.query(f"fold != {fold_id}"), test_filter]).reset_index(
+                    drop=True
+                )[["text", "label"]]
             )
             train_tokenized = train_dataset.map(preprocess_function, batched=True)
 
@@ -61,26 +79,22 @@ if __name__ == "__main__":
             data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
 
             model = AutoModelForSequenceClassification.from_pretrained(
-                "rinna/japanese-gpt-1b", num_labels=2
+                "rinna/japanese-gpt2-medium", num_labels=2
             )
             model.config.pad_token_id = model.config.eos_token_id
 
-            for name, param in model.named_parameters():
-                if name not in ("score.weight",):
-                    param.requires_grad = False
-
             training_args = TrainingArguments(
                 output_dir=f"../tmp/results{fold_id}",
-                learning_rate=5e-3,
+                learning_rate=4e-5,
                 per_device_train_batch_size=4,
-                per_device_eval_batch_size=8,
-                num_train_epochs=2,
+                per_device_eval_batch_size=64,
+                num_train_epochs=6,
                 weight_decay=0.01,
                 evaluation_strategy="steps",
-                eval_steps=100,
+                eval_steps=250,
                 load_best_model_at_end=True,
                 save_steps=1000,
-                gradient_accumulation_steps=4,
+                gradient_accumulation_steps=3,
                 save_total_limit=3,
                 fp16=True,
             )
@@ -99,9 +113,10 @@ if __name__ == "__main__":
 
             oof_results = trainer.predict(test_dataset=val_tokenized)
             np.save(f"oof_prediction{fold_id}", oof_results.predictions)
+            oof = df.query(f"fold == {fold_id}").copy()
+            oof["pred0"] = oof_results.predictions[:, 0]
+            oof["pred1"] = oof_results.predictions[:, 1]
+            oof.to_csv(f"oof{fold_id}.csv", index=False)
 
             results = trainer.predict(test_dataset=test_tokenized)
             np.save(f"test_prediction{fold_id}", results.predictions)
-
-    test["isFake"] = np.argmax(results.predictions, axis=-1)
-    test[["id", "isFake"]].to_csv("submission.csv", index=False)
